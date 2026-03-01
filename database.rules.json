@@ -1,0 +1,46 @@
+{
+  "rules": {
+    "users": {
+      "$userID": {
+        ".read":  "auth != null",
+        ".write": "auth != null && (root.child('userMap').child(auth.uid).val() === $userID)"
+      }
+    },
+    "userMap": {
+      "$uid": {
+        ".read":  "auth != null && auth.uid === $uid",
+        ".write": "auth != null && auth.uid === $uid"
+      }
+    },
+    "messages": {
+      "$chatKey": {
+        ".read":  "auth != null && ($chatKey.contains(root.child('userMap').child(auth.uid).val()))",
+        ".write": "auth != null && ($chatKey.contains(root.child('userMap').child(auth.uid).val()))"
+      }
+    },
+    "calls": {
+      "$userID": {
+        ".read":  "auth != null && (root.child('userMap').child(auth.uid).val() === $userID || $userID.contains(root.child('userMap').child(auth.uid).val()))",
+        ".write": "auth != null"
+      }
+    },
+    "presence": {
+      "$userID": {
+        ".read":  "auth != null",
+        ".write": "auth != null && root.child('userMap').child(auth.uid).val() === $userID"
+      }
+    },
+    "typing": {
+      "$chatKey": {
+        ".read":  "auth != null && $chatKey.contains(root.child('userMap').child(auth.uid).val())",
+        ".write": "auth != null && $chatKey.contains(root.child('userMap').child(auth.uid).val())"
+      }
+    },
+    "fcmTokens": {
+      "$userID": {
+        ".read":  "auth != null && root.child('userMap').child(auth.uid).val() === $userID",
+        ".write": "auth != null && root.child('userMap').child(auth.uid).val() === $userID"
+      }
+    }
+  }
+}
