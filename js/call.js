@@ -7,7 +7,7 @@ const ICE_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    // FREE TURN servers via Open Relay Project (metered.ca) — replace with your own for production
+    // FREE TURN relay servers — replace with your own credentials in production
     {
       urls: 'turn:openrelay.metered.ca:80',
       username: 'openrelayproject',
@@ -43,11 +43,10 @@ let otherID = null;
 let otherName = null;
 let onCallEndedCallback = null;
 
-// ─── LISTENER REFERENCES (store both ref + callback for proper cleanup) ───────
-let listenerRefs = {}; // { key: { ref, callback } }
+// ─── LISTENER REFERENCES ──────────────────────────────────────────────────────
+let listenerRefs = {};
 
 function addListener(key, dbRef, callback) {
-  // Remove old listener if exists
   removeListener(key);
   onValue(dbRef, callback);
   listenerRefs[key] = { ref: dbRef, callback };
@@ -62,9 +61,7 @@ function removeListener(key) {
 
 function cleanupListeners() {
   Object.keys(listenerRefs).forEach(key => {
-    try {
-      off(listenerRefs[key].ref, listenerRefs[key].callback);
-    } catch (e) {}
+    try { off(listenerRefs[key].ref, listenerRefs[key].callback); } catch (e) {}
   });
   listenerRefs = {};
 }
@@ -75,25 +72,8 @@ export function initCall(myUserID, otherUserID, otherUserName, onEnded) {
   otherName = otherUserName;
   onCallEndedCallback = onEnded;
   listenForIncomingCall();
-  // Note: presence/online status is handled by chat.js listenToPresence()
 }
 
-// Listen for online status
-function listenForOnlineStatus() {
-  addListener('onlineStatus', ref(db, 'presence/' + otherID), (snap) => {
-    const statusEl = document.getElementById('chatStatus');
-    if (!statusEl) return;
-    if (snap.exists() && snap.val() === 'online') {
-      statusEl.textContent = 'online';
-      statusEl.style.color = '#22C55E';
-    } else {
-      statusEl.textContent = 'tap for info';
-      statusEl.style.color = '';
-    }
-  });
-}
-
-// Set my online presence
 export function setOnline(userID) {
   set(ref(db, 'presence/' + userID), 'online');
   window.addEventListener('beforeunload', () => {
@@ -101,7 +81,55 @@ export function setOnline(userID) {
   });
 }
 
-// ─── START CALL (CALLER) ───────────────────────────────────────────────────────
+// ─── CREATE PEER CONNECTION ────────────────────────────────────────────────────
+// FIX: Centralized so ontrack is ALWAYS registered before any signaling begins.
+// The original code registered ontrack AFTER addTrack/offer creation which could
+// cause the remote stream event to be missed, especially on mobile Chrome.
+function createPeerConnection(onRemoteStream) {
+  const pc = new RTCPeerConnection(ICE_SERVERS);
+
+  // FIX: e.streams[0] can be undefined on Android Chrome — build stream from track if needed
+  pc.ontrack = (e) => {
+    console.log('[WebRTC] ontrack:', e.track.kind, 'streams:', e.streams.length);
+    let stream;
+    if (e.streams && e.streams[0]) {
+      stream = e.streams[0];
+    } else {
+      stream = new MediaStream();
+      stream.addTrack(e.track);
+    }
+    onRemoteStream(stream);
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    console.log('[WebRTC] ICE state:', pc.iceConnectionState);
+    // Force remote video play when ICE connects
+    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+      const remoteVideo = document.getElementById('remoteVideo');
+      if (remoteVideo && remoteVideo.srcObject && remoteVideo.paused) {
+        remoteVideo.play().catch(() => {});
+      }
+    }
+  };
+
+  pc.onconnectionstatechange = () => {
+    console.log('[WebRTC] Connection:', pc.connectionState);
+  };
+
+  return pc;
+}
+
+// ─── SET REMOTE STREAM ────────────────────────────────────────────────────────
+function setRemoteStream(stream) {
+  const remoteVideo = document.getElementById('remoteVideo');
+  if (!remoteVideo) return;
+  console.log('[WebRTC] Setting remote stream, tracks:', stream.getTracks().length);
+  remoteVideo.srcObject = stream;
+  // FIX: Mobile browsers need explicit play() call — autoplay attribute alone is not enough
+  remoteVideo.play().catch(err => console.warn('[WebRTC] Remote play():', err));
+}
+
+// ─── START CALL (CALLER) ──────────────────────────────────────────────────────
 export async function startCall(type) {
   callType = type;
   callRole = 'caller';
@@ -110,26 +138,29 @@ export async function startCall(type) {
   try {
     localStream = await getMedia(type);
   } catch (err) {
-    alert('Camera/Microphone access denied.');
+    alert('Camera/Microphone access denied. Please allow permissions and try again.');
     return;
   }
 
   showOutgoingScreen();
   playRingtone();
 
-  // Write ringing signal to receiver's call node
   await set(ref(db, 'calls/' + otherID), {
     callID,
     callerID: myID,
-    callerName: localStorage.getItem('aschat_name') || myID, // caller's OWN name
+    callerName: localStorage.getItem('aschat_name') || myID,
     callType: type,
     status: 'ringing',
     timestamp: Date.now()
   });
 
-  // Setup peer connection
-  peerConnection = new RTCPeerConnection(ICE_SERVERS);
-  localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+  // FIX: Create peer connection (with ontrack) BEFORE addTrack and createOffer
+  peerConnection = createPeerConnection(setRemoteStream);
+
+  localStream.getTracks().forEach(track => {
+    console.log('[WebRTC] Caller addTrack:', track.kind);
+    peerConnection.addTrack(track, localStream);
+  });
 
   peerConnection.onicecandidate = async (e) => {
     if (e.candidate) {
@@ -137,59 +168,42 @@ export async function startCall(type) {
     }
   };
 
-  peerConnection.ontrack = (e) => {
-    const remoteVideo = document.getElementById('remoteVideo');
-    if (remoteVideo) remoteVideo.srcObject = e.streams[0];
-  };
-
-  // Create and send offer
   const offer = await peerConnection.createOffer();
   await peerConnection.setLocalDescription(offer);
   await set(ref(db, 'calls/' + callID + '/offer'), { type: offer.type, sdp: offer.sdp });
+  console.log('[WebRTC] Caller: offer sent');
 
-  // Listen for answer from callee
   addListener('answer', ref(db, 'calls/' + callID + '/answer'), async (snap) => {
     if (!snap.exists() || !peerConnection) return;
     if (peerConnection.signalingState !== 'have-local-offer') return;
-    const answer = snap.val();
-    await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+    console.log('[WebRTC] Caller: got answer');
+    await peerConnection.setRemoteDescription(new RTCSessionDescription(snap.val()));
     showActiveScreen();
   });
 
-  // Listen for callee ICE candidates (deduplicated)
   const addedCalleeCandidates = new Set();
   addListener('calleeCandidates', ref(db, 'calls/' + callID + '/calleeCandidates'), (snap) => {
     if (!snap.exists() || !peerConnection) return;
     snap.forEach(child => {
       if (addedCalleeCandidates.has(child.key)) return;
       addedCalleeCandidates.add(child.key);
-      peerConnection.addIceCandidate(new RTCIceCandidate(child.val())).catch(() => {});
+      peerConnection.addIceCandidate(new RTCIceCandidate(child.val())).catch(e =>
+        console.warn('[WebRTC] addIceCandidate:', e)
+      );
     });
   });
 
-  // ── KEY FIX: Caller watches the RECEIVER's call node for status changes ───
-  // When receiver declines/ends, they update calls/otherID.status
   addListener('calleeStatus', ref(db, 'calls/' + otherID), (snap) => {
-    if (!callRole) return; // already cleaned up
-
-    if (!snap.exists()) {
-      // Node deleted — treat as ended if we're still in a call
-      return;
-    }
-
+    if (!callRole) return;
+    if (!snap.exists()) return;
     const data = snap.val();
-    if (data.status === 'declined') {
-      handleCallEnded('declined');
-    } else if (data.status === 'ended') {
-      handleCallEnded('ended');
-    }
+    if (data.status === 'declined') handleCallEnded('declined');
+    else if (data.status === 'ended') handleCallEnded('ended');
   });
 
-  // Missed call after 30 seconds
   missedCallTimer = setTimeout(async () => {
     if (callRole === 'caller') {
       await saveMissedCallMessage();
-      // Signal receiver that caller gave up
       await update(ref(db, 'calls/' + otherID), { status: 'missed' }).catch(() => {});
       handleCallEnded('missed');
     }
@@ -200,29 +214,17 @@ export async function startCall(type) {
 function listenForIncomingCall() {
   addListener('incomingCall', ref(db, 'calls/' + myID), async (snap) => {
     if (!snap.exists()) {
-      // ── KEY FIX: Node deleted = caller hung up / cancelled ────────────────
-      // Only act if we're currently in a callee role (ringing or in call)
-      if (callRole === 'callee') {
-        handleCallEnded('ended');
-      }
+      if (callRole === 'callee') handleCallEnded('ended');
       return;
     }
 
     const data = snap.val();
-
-    // If we already handled an end signal
     if (data.status === 'ended' || data.status === 'missed') {
-      if (callRole === 'callee') {
-        handleCallEnded('ended');
-      }
+      if (callRole === 'callee') handleCallEnded('ended');
       return;
     }
-
-    // Ignore if not a ringing signal or not from expected caller
     if (data.status !== 'ringing') return;
     if (data.callerID !== otherID) return;
-
-    // Prevent re-triggering if already in a call
     if (callRole === 'callee') return;
 
     callID = data.callID;
@@ -232,17 +234,15 @@ function listenForIncomingCall() {
     showIncomingScreen(data.callerID, data.callType);
     playRingtone();
 
-    // Missed call cleanup after 30 seconds (caller side also fires at 30s)
     missedCallTimer = setTimeout(async () => {
       if (callRole === 'callee') {
         stopRingtone();
         hideAllCallScreens();
         cleanupListeners();
         cleanupCall();
-        // Restart listening for new calls
         listenForIncomingCall();
       }
-    }, 31000); // slightly longer than caller's 30s to let caller clean up first
+    }, 31000);
   });
 }
 
@@ -254,15 +254,19 @@ export async function acceptCall() {
   try {
     localStream = await getMedia(callType);
   } catch (err) {
-    alert('Camera/Microphone access denied.');
+    alert('Camera/Microphone access denied. Please allow permissions and try again.');
     return;
   }
 
-  // Update status so caller knows call is accepted
   await update(ref(db, 'calls/' + myID), { status: 'accepted' });
 
-  peerConnection = new RTCPeerConnection(ICE_SERVERS);
-  localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+  // FIX: Create peer connection (with ontrack) BEFORE addTrack and setRemoteDescription
+  peerConnection = createPeerConnection(setRemoteStream);
+
+  localStream.getTracks().forEach(track => {
+    console.log('[WebRTC] Callee addTrack:', track.kind);
+    peerConnection.addTrack(track, localStream);
+  });
 
   peerConnection.onicecandidate = async (e) => {
     if (e.candidate) {
@@ -270,29 +274,29 @@ export async function acceptCall() {
     }
   };
 
-  peerConnection.ontrack = (e) => {
-    const remoteVideo = document.getElementById('remoteVideo');
-    if (remoteVideo) remoteVideo.srcObject = e.streams[0];
-  };
-
-  // Get offer
   const offerSnap = await get(ref(db, 'calls/' + callID + '/offer'));
-  if (!offerSnap.exists()) return;
+  if (!offerSnap.exists()) {
+    console.error('[WebRTC] No offer found!');
+    return;
+  }
+
+  console.log('[WebRTC] Callee: setting remote description (offer)');
   await peerConnection.setRemoteDescription(new RTCSessionDescription(offerSnap.val()));
 
-  // Create and send answer
   const answer = await peerConnection.createAnswer();
   await peerConnection.setLocalDescription(answer);
   await set(ref(db, 'calls/' + callID + '/answer'), { type: answer.type, sdp: answer.sdp });
+  console.log('[WebRTC] Callee: answer sent');
 
-  // Get caller ICE candidates (deduplicated)
   const addedCallerCandidates = new Set();
   addListener('callerCandidates', ref(db, 'calls/' + callID + '/callerCandidates'), (snap) => {
     if (!snap.exists() || !peerConnection) return;
     snap.forEach(child => {
       if (addedCallerCandidates.has(child.key)) return;
       addedCallerCandidates.add(child.key);
-      peerConnection.addIceCandidate(new RTCIceCandidate(child.val())).catch(() => {});
+      peerConnection.addIceCandidate(new RTCIceCandidate(child.val())).catch(e =>
+        console.warn('[WebRTC] addIceCandidate:', e)
+      );
     });
   });
 
@@ -300,12 +304,11 @@ export async function acceptCall() {
   showActiveScreen();
 }
 
-// ─── DECLINE CALL (CALLEE) ────────────────────────────────────────────────────
+// ─── DECLINE CALL ─────────────────────────────────────────────────────────────
 export async function declineCall() {
   stopRingtone();
   clearTimeout(missedCallTimer);
 
-  // Update status so CALLER sees declined, then clean up
   try {
     await update(ref(db, 'calls/' + myID), { status: 'declined' });
     await saveCallMessage('declined');
@@ -319,36 +322,30 @@ export async function declineCall() {
   hideAllCallScreens();
   cleanupListeners();
   cleanupCall();
-
-  // Resume listening for new incoming calls
   listenForIncomingCall();
 }
 
-// ─── END CALL (EITHER SIDE) ───────────────────────────────────────────────────
+// ─── END CALL ─────────────────────────────────────────────────────────────────
 export async function endCall() {
-  if (!callRole) return; // prevent double-call
+  if (!callRole) return;
 
   stopRingtone();
   clearTimeout(missedCallTimer);
   clearInterval(callTimerInterval);
 
   const duration = formatDuration(callSeconds);
-  const currentRole = callRole; // snapshot before cleanup clears it
+  const currentRole = callRole;
   const currentCallID = callID;
 
   try {
     if (currentRole === 'caller') {
-      // ── KEY FIX: Update the receiver's call node so they see "ended" ──────
       await update(ref(db, 'calls/' + otherID), { status: 'ended' });
     } else {
-      // ── KEY FIX: Update my call node so caller sees "ended" ───────────────
       await update(ref(db, 'calls/' + myID), { status: 'ended' });
     }
-
     await saveCallMessage('ended', duration);
   } catch (err) { console.error('End call error:', err); }
 
-  // Clean up Firebase nodes after a short delay (gives other side time to read status)
   setTimeout(async () => {
     try {
       if (currentRole === 'caller') {
@@ -363,29 +360,31 @@ export async function endCall() {
   hideAllCallScreens();
   cleanupListeners();
   cleanupCall();
-
-  // Resume listening for new incoming calls
   listenForIncomingCall();
 }
 
-// ─── HANDLE CALL ENDED (remote side hung up / declined / missed) ──────────────
+// ─── HANDLE CALL ENDED (remote side) ─────────────────────────────────────────
 function handleCallEnded(reason) {
-  if (!callRole) return; // prevent double-firing
-
+  if (!callRole) return;
   stopRingtone();
   clearTimeout(missedCallTimer);
   clearInterval(callTimerInterval);
-
   hideAllCallScreens();
   cleanupListeners();
   cleanupCall();
-
-  // Resume listening for new incoming calls
   listenForIncomingCall();
 }
 
-// ─── CLEANUP CALL STATE ───────────────────────────────────────────────────────
+// ─── CLEANUP ──────────────────────────────────────────────────────────────────
 function cleanupCall() {
+  // FIX: Clear srcObject to release camera and avoid frozen frames
+  const remoteVideo = document.getElementById('remoteVideo');
+  const localVideo = document.getElementById('localVideo');
+  const localVideoOut = document.getElementById('localVideoOut');
+  if (remoteVideo) remoteVideo.srcObject = null;
+  if (localVideo) localVideo.srcObject = null;
+  if (localVideoOut) localVideoOut.srcObject = null;
+
   if (localStream) {
     localStream.getTracks().forEach(t => t.stop());
     localStream = null;
@@ -404,9 +403,24 @@ function cleanupCall() {
 }
 
 // ─── GET MEDIA ────────────────────────────────────────────────────────────────
+// FIX: Use ideal constraints not exact — exact can silently fail on Android
 async function getMedia(type) {
   if (type === 'video') {
-    return await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: {
+          facingMode: { ideal: 'user' },
+          width: { ideal: 640 },
+          height: { ideal: 480 }
+        }
+      });
+      console.log('[Media] Got video stream, tracks:', stream.getTracks().map(t => t.kind));
+      return stream;
+    } catch (err) {
+      console.warn('[Media] Fallback to basic video...', err);
+      return await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+    }
   }
   return await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
 }
@@ -434,6 +448,7 @@ function showOutgoingScreen() {
     if (localOut) {
       localOut.srcObject = localStream;
       localOut.style.display = 'block';
+      localOut.play().catch(() => {});
     }
   }
 }
@@ -474,10 +489,23 @@ function showActiveScreen() {
   document.getElementById('activeCallName').textContent = otherName;
 
   if (callType === 'video') {
-    document.getElementById('remoteVideo').style.display = 'block';
-    document.getElementById('localVideo').style.display = 'block';
+    const remoteVideo = document.getElementById('remoteVideo');
+    const localVideo = document.getElementById('localVideo');
+
+    remoteVideo.style.display = 'block';
+    localVideo.style.display = 'block';
     document.getElementById('camBtn').style.display = 'flex';
-    if (localStream) document.getElementById('localVideo').srcObject = localStream;
+
+    // FIX: Explicitly set srcObject and call play() — autoplay alone unreliable on mobile
+    if (localStream) {
+      localVideo.srcObject = localStream;
+      localVideo.play().catch(err => console.warn('[Media] localVideo play():', err));
+    }
+
+    // If remote stream already arrived before showActiveScreen, force play
+    if (remoteVideo.srcObject) {
+      remoteVideo.play().catch(err => console.warn('[Media] remoteVideo play():', err));
+    }
   } else {
     document.getElementById('remoteVideo').style.display = 'none';
     document.getElementById('localVideo').style.display = 'none';
@@ -491,8 +519,7 @@ function showActiveScreen() {
 }
 
 function hideAllCallScreens() {
-  const screens = ['outgoingCallScreen', 'incomingCallScreen', 'activeCallScreen'];
-  screens.forEach(id => {
+  ['outgoingCallScreen', 'incomingCallScreen', 'activeCallScreen'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.style.display = 'none';
   });
@@ -533,19 +560,12 @@ export function toggleCamera() {
 // ─── RINGTONE ─────────────────────────────────────────────────────────────────
 function playRingtone() {
   const ringtone = document.getElementById('ringtone');
-  if (ringtone) {
-    ringtone.loop = true;
-    ringtone.play().catch(() => {});
-  }
+  if (ringtone) { ringtone.loop = true; ringtone.play().catch(() => {}); }
 }
 
 function stopRingtone() {
   const ringtone = document.getElementById('ringtone');
-  if (ringtone) {
-    ringtone.loop = false;
-    ringtone.pause();
-    ringtone.currentTime = 0;
-  }
+  if (ringtone) { ringtone.loop = false; ringtone.pause(); ringtone.currentTime = 0; }
 }
 
 // ─── CALL MESSAGES ────────────────────────────────────────────────────────────
