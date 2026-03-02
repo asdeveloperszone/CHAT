@@ -7,8 +7,24 @@ const ICE_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-  ]
+    // FREE TURN servers via Open Relay Project (metered.ca) — replace with your own for production
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
+  ],
+  iceCandidatePoolSize: 10
 };
 
 let peerConnection = null;
@@ -140,10 +156,13 @@ export async function startCall(type) {
     showActiveScreen();
   });
 
-  // Listen for callee ICE candidates
+  // Listen for callee ICE candidates (deduplicated)
+  const addedCalleeCandidates = new Set();
   addListener('calleeCandidates', ref(db, 'calls/' + callID + '/calleeCandidates'), (snap) => {
     if (!snap.exists() || !peerConnection) return;
     snap.forEach(child => {
+      if (addedCalleeCandidates.has(child.key)) return;
+      addedCalleeCandidates.add(child.key);
       peerConnection.addIceCandidate(new RTCIceCandidate(child.val())).catch(() => {});
     });
   });
@@ -266,10 +285,13 @@ export async function acceptCall() {
   await peerConnection.setLocalDescription(answer);
   await set(ref(db, 'calls/' + callID + '/answer'), { type: answer.type, sdp: answer.sdp });
 
-  // Get caller ICE candidates
+  // Get caller ICE candidates (deduplicated)
+  const addedCallerCandidates = new Set();
   addListener('callerCandidates', ref(db, 'calls/' + callID + '/callerCandidates'), (snap) => {
     if (!snap.exists() || !peerConnection) return;
     snap.forEach(child => {
+      if (addedCallerCandidates.has(child.key)) return;
+      addedCallerCandidates.add(child.key);
       peerConnection.addIceCandidate(new RTCIceCandidate(child.val())).catch(() => {});
     });
   });
